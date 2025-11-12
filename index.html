@@ -1,0 +1,360 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>SecretNote</title>
+  <meta name="theme-color" content="#2b2b2b"/>
+  <!-- Make installable as PWA -->
+  <link rel="manifest" href="manifest.json" />
+  <style>
+    body { font-family: Arial, sans-serif; max-width:720px; margin:18px auto; padding:12px; color:#111; }
+    h1 { text-align:center; }
+    label { display:block; margin-top:8px; font-weight:600; }
+    input, button, select, textarea { width:100%; padding:8px; margin-top:6px; box-sizing:border-box; }
+    .small { font-size:0.9em; color:#555; }
+    .row { display:flex; gap:8px; }
+    .row > * { flex:1; }
+    .card { border-radius:8px; padding:12px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); margin-top:12px; }
+    .danger { color:#b33; }
+    #adminCount { font-weight:700; }
+  </style>
+</head>
+<body>
+  <h1>SecretNote</h1>
+  <div id="app">
+    <!-- Registration / login -->
+    <div id="signupDiv" class="card">
+      <h3>Create account (First, Middle, Last)</h3>
+      <label>First name<input id="first" /></label>
+      <label>Middle name<input id="middle" /></label>
+      <label>Last name<input id="last" /></label>
+      <label>Your phone (start with 0, e.g. 0712345678)<input id="myPhone" /></label>
+      <label>Create 4-digit PIN (for login)<input id="pin" maxlength="4" /></label>
+      <label>Encryption passphrase (save this, used to view encrypted names)<input id="passphrase" /></label>
+      <div class="small">You will add up to two people you love next.</div>
+      <button id="createBtn">Create account & continue ➜</button>
+      <div class="small">Already have account? Log in below.</div>
+    </div>
+
+    <div id="loginDiv" class="card">
+      <h3>Login</h3>
+      <label>Phone (start with 0)<input id="loginPhone" /></label>
+      <label>PIN<input id="loginPin" maxlength="4" /></label>
+      <button id="loginBtn">Login</button>
+    </div>
+
+    <div id="mainDiv" style="display:none" class="card">
+      <h3>Welcome — SecretNote</h3>
+      <div id="status" class="small"></div>
+
+      <h4>Add up to 2 people you love</h4>
+      <div id="loveInputs"></div>
+      <button id="saveLoves">Save loves</button>
+
+      <div id="matchesArea" style="margin-top:10px">
+        <h4>Your matches</h4>
+        <div id="matchesList" class="small">No matches yet.</div>
+      </div>
+
+      <div style="margin-top:12px">
+        <button id="logoutBtn">Logout</button>
+      </div>
+    </div>
+
+    <div id="adminDiv" class="card" style="margin-top:18px;">
+      <h3>Admin / Stats (for you)</h3>
+      <div>Number of accounts created: <span id="adminCount">—</span></div>
+      <div class="small">This is a simple count pulled from database.</div>
+    </div>
+
+    <div style="margin-top:18px" class="small">
+      <strong>Privacy summary:</strong> phone numbers of loved people are stored as SHA-256 hashes. Names are encrypted in your browser before sending. You must keep your passphrase safe to decrypt names.
+    </div>
+  </div>
+
+  <!-- Firebase JS SDKs (CDN) -->
+  <script src="https://www.gstatic.com/firebasejs/10.9.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.9.0/firebase-firestore-compat.js"></script>
+
+  <script>
+  // ---------- CONFIG: replace with your Firebase config object ----------
+  const firebaseConfig = {
+    apiKey: "AIzaSyCwbv--o22Hdtn7JPCzfe4EB35M2kTek3U",
+  authDomain: "secretnote-123.firebaseapp.com",
+  projectId: "secretnote-123",
+  storageBucket: "secretnote-123.firebasestorage.app",
+  messagingSenderId: "409212839703",
+  appId: "1:409212839703:web:db41154a22093043463952",
+  measurementId: "G-VG3KSD9QH9"
+  };
+  // --------------------------------------------------------------------
+
+  // Initialize Firebase
+  firebase.initializeApp(firebaseConfig);
+  const db = firebase.firestore();
+
+  // Utility functions: normalize phone and hashing
+  function normalizePhone(p) {
+    if (!p) return '';
+    p = p.trim();
+    // remove non-digit chars
+    p = p.replace(/[^0-9]/g,'');
+    // ensure starts with 0 (user must enter starting 0)
+    if (!p.startsWith('0')) p = '0' + p;
+    return p;
+  }
+
+  async function sha256hex(message) {
+    const msgUint8 = new TextEncoder().encode(message);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    const hashHex = hashArray.map(b => b.toString(16).padStart(2,'0')).join('');
+    return hashHex;
+  }
+
+  // AES-GCM encrypt/decrypt with passphrase (derived key)
+  async function deriveKey(pass) {
+    const enc = new TextEncoder();
+    const passKey = await crypto.subtle.importKey('raw', enc.encode(pass), 'PBKDF2', false, ['deriveKey']);
+    return crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt: enc.encode('secretnote-salt-v1'), iterations: 100000, hash: 'SHA-256' },
+      passKey,
+      { name:'AES-GCM', length:256 },
+      false,
+      ['encrypt','decrypt']
+    );
+  }
+
+  async function encryptText(plain, pass) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const key = await deriveKey(pass);
+    const enc = new TextEncoder();
+    const cipher = await crypto.subtle.encrypt({ name:'AES-GCM', iv }, key, enc.encode(plain));
+    // return iv + cipher as base64
+    const combined = new Uint8Array(iv.byteLength + cipher.byteLength);
+    combined.set(iv,0); combined.set(new Uint8Array(cipher), iv.byteLength);
+    return btoa(String.fromCharCode(...combined));
+  }
+
+  async function decryptText(b64, pass) {
+    try {
+      const combined = Uint8Array.from(atob(b64), c=>c.charCodeAt(0));
+      const iv = combined.slice(0,12);
+      const cipher = combined.slice(12);
+      const key = await deriveKey(pass);
+      const plainBuffer = await crypto.subtle.decrypt({name:'AES-GCM', iv}, key, cipher);
+      return new TextDecoder().decode(plainBuffer);
+    } catch(e) {
+      return null;
+    }
+  }
+
+  // DOM elements
+  const createBtn = document.getElementById('createBtn');
+  const loginBtn = document.getElementById('loginBtn');
+  const saveLovesBtn = document.getElementById('saveLoves');
+  const logoutBtn = document.getElementById('logoutBtn');
+  const adminCountEl = document.getElementById('adminCount');
+  const matchesList = document.getElementById('matchesList');
+
+  // Local session
+  let session = { docId: null, phoneHash: null, passphrase: null };
+
+  // Create account
+  createBtn?.addEventListener('click', async ()=>{
+    const first = document.getElementById('first').value.trim();
+    const middle = document.getElementById('middle').value.trim();
+    const last = document.getElementById('last').value.trim();
+    const phone = normalizePhone(document.getElementById('myPhone').value);
+    const pin = document.getElementById('pin').value.trim();
+    const passphrase = document.getElementById('passphrase').value;
+
+    if (!first || !middle || !last || !phone || pin.length<4 || !passphrase) {
+      alert('Fill all fields correctly: names, phone, 4-digit PIN, and a passphrase.');
+      return;
+    }
+    // compute phone hash and pin hash
+    const phoneHash = await sha256hex(phone);
+    const pinHash = await sha256hex(pin);
+
+    // encrypt names before sending
+    const encrypted = await encryptText(JSON.stringify({first,middle,last}), passphrase);
+
+    // create document in /users where id = phoneHash (simple)
+    const docRef = db.collection('users').doc(phoneHash);
+    const doc = await docRef.get();
+    if (doc.exists) {
+      alert('Account with that phone already exists. Please log in.');
+      return;
+    }
+
+    await docRef.set({
+      phoneHash,
+      pinHash,
+      namesEncrypted: encrypted,
+      loves: [], // array of {hash:..., labelEncrypted:...}
+      createdAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+
+    alert('Account created. Now log in using your phone and PIN.');
+    // prefill login fields
+    document.getElementById('loginPhone').value = phone;
+    document.getElementById('loginPin').value = pin;
+    // store passphrase locally for session (won't persist if page reload)
+    session.passphrase = passphrase;
+  });
+
+  // Login
+  loginBtn?.addEventListener('click', async ()=>{
+    const phone = normalizePhone(document.getElementById('loginPhone').value);
+    const pin = document.getElementById('loginPin').value.trim();
+    if (!phone || pin.length<4) { alert('Enter phone and 4-digit PIN'); return; }
+    const phoneHash = await sha256hex(phone);
+    const pinHash = await sha256hex(pin);
+
+    const docRef = db.collection('users').doc(phoneHash);
+    const doc = await docRef.get();
+    if (!doc.exists) { alert('No account. Please create one.'); return; }
+    const data = doc.data();
+    if (data.pinHash !== pinHash) { alert('Wrong PIN'); return; }
+    // success
+    session.docId = phoneHash;
+    session.phoneHash = phoneHash;
+    // ask user for passphrase to decrypt names
+    const passphrase = prompt('Enter encryption passphrase you used at signup (required to view encrypted names). Keep it safe. If you forget it, you cannot view encrypted names.');
+    session.passphrase = passphrase;
+    // show main UI
+    document.getElementById('signupDiv').style.display='none';
+    document.getElementById('loginDiv').style.display='none';
+    document.getElementById('mainDiv').style.display='block';
+    document.getElementById('status').textContent = 'Logged in as: ' + phone;
+    await renderLoveInputs();
+    await fetchMatches();
+    await updateAdminCount();
+  });
+
+  // Render two love input slots
+  async function renderLoveInputs() {
+    document.getElementById('loveInputs').innerHTML = '';
+    const doc = await db.collection('users').doc(session.docId).get();
+    const data = doc.exists ? doc.data() : null;
+    const existing = (data && data.loves) ? data.loves : [];
+    for (let i=0;i<2;i++) {
+      const div = document.createElement('div');
+      div.className='card';
+      const label = document.createElement('div');
+      label.innerHTML = '<strong>Person slot '+(i+1)+'</strong>';
+      const nameIn = document.createElement('input');
+      nameIn.placeholder = 'Name (optional)';
+      const phoneIn = document.createElement('input');
+      phoneIn.placeholder = 'Phone (start with 0)';
+      if (existing[i]) {
+        // try to decrypt label
+        let decrypted = null;
+        if (existing[i].labelEncrypted && session.passphrase) {
+          decrypted = await decryptText(existing[i].labelEncrypted, session.passphrase);
+        }
+        nameIn.value = decrypted || '';
+        // phone is not stored raw (only hashed) so leave blank
+      }
+      div.appendChild(label);
+      div.appendChild(nameIn);
+      div.appendChild(phoneIn);
+      document.getElementById('loveInputs').appendChild(div);
+    }
+  }
+
+  // Save loves
+  saveLovesBtn?.addEventListener('click', async ()=>{
+    const containers = Array.from(document.getElementById('loveInputs').children);
+    const lovesToStore = [];
+    for (let c of containers) {
+      const inputs = c.querySelectorAll('input');
+      const name = inputs[0].value.trim();
+      const phoneRaw = normalizePhone(inputs[1].value);
+      if (!phoneRaw) continue;
+      if (!phoneRaw.startsWith('0')) { alert('Phone must start with 0'); return; }
+      const hash = await sha256hex(phoneRaw);
+      let labelEncrypted = null;
+      if (name && session.passphrase) labelEncrypted = await encryptText(name, session.passphrase);
+      lovesToStore.push({hash, labelEncrypted});
+    }
+    // Save to Firestore
+    await db.collection('users').doc(session.docId).update({ loves: lovesToStore });
+    alert('Saved. Matching will be checked now.');
+    await fetchMatches();
+    await updateAdminCount();
+  });
+
+  // Fetch matches (simple): find any users whose loves include our own phone hash & we include theirs
+  async function fetchMatches() {
+    matchesList.textContent = 'Checking...';
+    const myDoc = await db.collection('users').doc(session.docId).get();
+    const myData = myDoc.data();
+    const myLoves = (myData && myData.loves) ? myData.loves : [];
+    const matches = [];
+    // For each person I love (hash), find users who have that hash? We want reciprocal: check users whose loves include my phone hash
+    const snapshot = await db.collection('users').where('loves', '!=', []).get();
+    // naive loop (ok for small apps)
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      const theirLoves = data.loves || [];
+      // check if any of their love hashes equals any of mine (for reciprocal check we need to see if they love ME)
+      // compute if they love me: their loves contains my phoneHash?
+      const theyLoveMe = theirLoves.some(l=>l.hash === session.phoneHash);
+      // I must love them too: check myLoves contains any hash that equals any of their phone? But we don't store their phone hash as a field — doc id is their phoneHash
+      // So to be a match: I have them as love target (myLoves hashes include doc.id) AND they have my phoneHash in their loves
+      const iLoveThem = myLoves.some(l => l.hash === doc.id);
+      if (iLoveThem && theyLoveMe) {
+        // decrypt their name if available
+        let displayName = '[name hidden]';
+        if (data.namesEncrypted && session.passphrase) {
+          const decrypted = await decryptText(data.namesEncrypted, session.passphrase);
+          if (decrypted) {
+            try { displayName = JSON.parse(decrypted).first + ' ' + JSON.parse(decrypted).middle + ' ' + JSON.parse(decrypted).last; }
+            catch(e) { displayName = decrypted; }
+          }
+        }
+        matches.push({id: doc.id, displayName});
+      }
+    }
+    if (matches.length===0) matchesList.textContent = 'No matches yet.';
+    else {
+      matchesList.innerHTML = matches.map(m => `<div>Matched with: <strong>${m.displayName}</strong></div>`).join('');
+    }
+  }
+
+  // Logout
+  logoutBtn?.addEventListener('click', ()=> {
+    session = { docId: null, phoneHash: null, passphrase: null };
+    document.getElementById('signupDiv').style.display='block';
+    document.getElementById('loginDiv').style.display='block';
+    document.getElementById('mainDiv').style.display='none';
+    matchesList.textContent = 'No matches yet.';
+  });
+
+  // Admin count
+  async function updateAdminCount() {
+    // VERY simple count (small DB)
+    const snap = await db.collection('users').get();
+    adminCountEl.textContent = snap.size;
+  }
+
+  // Create a simple manifest for PWA (so PWABuilder recognizes)
+  const manifest = {
+    name: "SecretNote",
+    short_name: "SecretNote",
+    start_url: ".",
+    display: "standalone",
+    background_color: "#ffffff",
+    icons: [{src:"icon-192.png", sizes:"192x192", type:"image/png"}]
+  };
+  const blob = new Blob([JSON.stringify(manifest)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('link');
+  link.rel='manifest'; link.href=url;
+  document.head.appendChild(link);
+  </script>
+</body>
+</html>
